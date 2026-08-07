@@ -298,8 +298,8 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
 
         # Multi-tenant state (used by the top-level/global cache only).
         self.personal_caches: Dict[str, RadixCache] = {}
-        self.prompt_request_tracker: Dict[str, Set[str]] = defaultdict(set)
-        self.promoted_prompt_keys: Set[str] = set()
+        self.prompt_request_tracker: Dict[Tuple[Optional[str], bool, Tuple[int, ...]], Set[str]] = defaultdict(set)
+        self.promoted_prompt_keys: Set[Tuple[Optional[str], bool, Tuple[int, ...]]] = set()
 
         self.kv_event_queue = []
 
@@ -463,10 +463,8 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
                 prompt_key = self._build_prompt_tracker_key(params.key)
                 requestors = self.prompt_request_tracker[prompt_key]
                 requestors.add(user_id)
-                if (
-                    len(requestors) >= self.PROMOTION_THRESHOLD
-                    and prompt_key not in self.promoted_prompt_keys
-                ):
+                threshold = self._get_promotion_threshold()
+                if len(requestors) >= threshold and prompt_key not in self.promoted_prompt_keys:
                     self.promoted_prompt_keys.add(prompt_key)
                     self._insert_single(
                         InsertParams(
@@ -862,14 +860,29 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         self.personal_caches[user_id] = personal_cache
         return personal_cache
 
-    def _build_prompt_tracker_key(self, key: Optional[RadixKey]) -> str:
+    def _build_prompt_tracker_key(
+        self, key: Optional[RadixKey]
+    ) -> Tuple[Optional[str], bool, Tuple[int, ...]]:
         if key is None:
-            return ""
+            return (None, False, ())
 
-        aligned_key, _ = key.maybe_to_bigram_view(self.is_eagle)
-        aligned_key = aligned_key.page_aligned(self.page_size)
-        token_ids = tuple(aligned_key.raw_token_ids())
-        return get_hash_str((aligned_key.extra_key, token_ids), None)
+        is_bigram = key.is_bigram or self.is_eagle
+        normalized_key = RadixKey(
+            token_ids=key.raw_token_ids(),
+            extra_key=key.extra_key,
+            is_bigram=is_bigram,
+        ).page_aligned(self.page_size)
+        token_ids = tuple(normalized_key.raw_token_ids())
+        return (normalized_key.extra_key, normalized_key.is_bigram, token_ids)
+
+    def _get_promotion_threshold(self) -> int:
+        threshold = self.PROMOTION_THRESHOLD
+        if threshold is None:
+            return 5
+        threshold = int(threshold)
+        if threshold <= 0:
+            return 1
+        return threshold
 
     def _iter_all_trees(self) -> list[RadixCache]:
         return [self] + list(self.personal_caches.values())
