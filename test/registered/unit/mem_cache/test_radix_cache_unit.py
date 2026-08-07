@@ -527,6 +527,132 @@ class TestRadixCache(unittest.TestCase):
         # Non-existent extra_key should not match
         self.assertEqual(len(result4.device_indices), 0)
 
+    def test_tenant_lookup_prefers_personal_then_global(self):
+        """Derived property: tenant lookups must prefer personal cache over global.
+
+        This guards the two-tier lookup contract. A future refactor that checks
+        the global cache first would silently leak cross-tenant timing benefits
+        and return the wrong KV mapping for users with personal entries.
+        """
+        cache = RadixCache.create_simulated()
+        key = RadixKey(array("q", [1, 2, 3, 4]))
+
+        global_value = torch.tensor([10, 20, 30, 40], dtype=torch.int64)
+        personal_value = torch.tensor([110, 120, 130, 140], dtype=torch.int64)
+
+        # Legacy/global insertion path (no user_id).
+        cache.insert(InsertParams(key=key, value=global_value))
+        # Tenant-scoped insertion path.
+        cache.insert(InsertParams(key=key, value=personal_value, user_id="user-a"))
+
+        user_a_match = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", [1, 2, 3, 4])), user_id="user-a")
+        )
+        torch.testing.assert_close(user_a_match.device_indices, personal_value)
+
+        user_b_match = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", [1, 2, 3, 4])), user_id="user-b")
+        )
+        torch.testing.assert_close(user_b_match.device_indices, global_value)
+
+    def test_tenant_promotion_requires_threshold_unique_users(self):
+        """Derived property: global promotion requires 5 unique miss users.
+
+        This guards the admission threshold and uniqueness semantics for
+        promotion tracking. Regressions here could re-enable side-channel
+        amplification via premature global visibility.
+        """
+        cache = RadixCache.create_simulated()
+        key = RadixKey(array("q", [7, 8, 9, 10]))
+        value = torch.tensor([70, 80, 90, 100], dtype=torch.int64)
+
+        for i in range(4):
+            cache.insert(
+                InsertParams(
+                    key=key,
+                    value=value,
+                    user_id=f"user-{i}",
+                    track_miss_for_promotion=True,
+                )
+            )
+
+        pre_threshold_match = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", [7, 8, 9, 10])), user_id="user-x")
+        )
+        self.assertEqual(len(pre_threshold_match.device_indices), 0)
+
+        cache.insert(
+            InsertParams(
+                key=key,
+                value=value,
+                user_id="user-4",
+                track_miss_for_promotion=True,
+            )
+        )
+
+        post_threshold_match = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", [7, 8, 9, 10])), user_id="user-x")
+        )
+        torch.testing.assert_close(post_threshold_match.device_indices, value)
+
+    def test_tenant_promotion_does_not_advance_on_hits(self):
+        """Derived property: hit-path inserts must not count toward promotion.
+
+        This distinguishes miss-driven promotion from normal hit writes. If a
+        future diff increments the tracker on cache hits, this test turns red by
+        promoting to global with fewer than 5 miss users.
+        """
+        cache = RadixCache.create_simulated()
+        key = RadixKey(array("q", [21, 22, 23, 24]))
+        value = torch.tensor([210, 220, 230, 240], dtype=torch.int64)
+
+        cache.insert(
+            InsertParams(
+                key=key,
+                value=value,
+                user_id="user-a",
+                track_miss_for_promotion=True,
+            )
+        )
+
+        # Simulate a hit-path write: it must not be counted for promotion.
+        cache.insert(
+            InsertParams(
+                key=key,
+                value=value,
+                user_id="user-b",
+                track_miss_for_promotion=False,
+            )
+        )
+
+        for user_id in ["user-c", "user-d", "user-e"]:
+            cache.insert(
+                InsertParams(
+                    key=key,
+                    value=value,
+                    user_id=user_id,
+                    track_miss_for_promotion=True,
+                )
+            )
+
+        not_promoted_match = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", [21, 22, 23, 24])), user_id="user-z")
+        )
+        self.assertEqual(len(not_promoted_match.device_indices), 0)
+
+        cache.insert(
+            InsertParams(
+                key=key,
+                value=value,
+                user_id="user-f",
+                track_miss_for_promotion=True,
+            )
+        )
+        promoted_match = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", [21, 22, 23, 24])), user_id="user-z")
+        )
+        torch.testing.assert_close(promoted_match.device_indices, value)
+
     def test_lock_ref_operations(self):
         """Test lock reference counting operations."""
         cache = RadixCache.create_simulated()

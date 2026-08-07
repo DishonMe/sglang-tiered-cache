@@ -116,6 +116,7 @@ def match_prefix_for_req(
             key=RadixKey(token_ids=token_ids, extra_key=req.extra_key, limit=key_limit),
             cow_mamba=cow_mamba,
             req=req if include_req else None,
+            user_id=req.session_id,
         )
     )
     if envs.SGLANG_RADIX_FORCE_MISS.get():

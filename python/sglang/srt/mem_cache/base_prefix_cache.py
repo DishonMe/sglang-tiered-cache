@@ -55,6 +55,9 @@ class MatchPrefixParams:
     cow_mamba: bool = False
     req: Optional[Req] = None
 
+    # Multi-tenant cache scope
+    user_id: Optional[str] = None
+
 
 @dataclasses.dataclass
 class InsertParams:
@@ -73,6 +76,12 @@ class InsertParams:
     # General
     chunked: bool = False
     priority: int = 0
+
+    # Multi-tenant cache scope
+    user_id: Optional[str] = None
+    # Whether this insert comes from a full cache miss and should participate
+    # in promotion tracking.
+    track_miss_for_promotion: bool = False
 
 
 @dataclasses.dataclass

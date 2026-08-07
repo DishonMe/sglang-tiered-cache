@@ -24,10 +24,11 @@ The radix tree data structure for managing the KV cache.
 import heapq
 import logging
 import sys
+import threading
 import time
 from array import array
 from collections import defaultdict
-from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Set, Tuple, Union
 
 import torch
 
@@ -240,6 +241,9 @@ class TreeNode:
 
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
+        # Back-pointer used by tenant-aware wrappers to dispatch lock/evict
+        # operations to the tree that owns this node.
+        self.owner_cache: Optional[RadixCache] = None
 
     @property
     def evicted(self):
@@ -277,7 +281,9 @@ class TreeNode:
 
 
 class RadixCache(KVCacheEventMixin, BasePrefixCache):
-    def __init__(self, params: CacheInitParams):
+    PROMOTION_THRESHOLD = 5
+
+    def __init__(self, params: CacheInitParams, *, _is_personal_cache: bool = False):
         self.disable = params.disable
         self.req_to_token_pool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
@@ -286,10 +292,18 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         self.is_eagle = params.is_eagle
         self.disable_finished_insert = params.disable_finished_insert
         self.eviction_policy = params.eviction_policy.lower()
+        self._is_personal_cache = _is_personal_cache
+        self._multi_tenant_enabled = not _is_personal_cache
+        self._state_lock = threading.RLock() if self._multi_tenant_enabled else None
+
+        # Multi-tenant state (used by the top-level/global cache only).
+        self.personal_caches: Dict[str, RadixCache] = {}
+        self.prompt_request_tracker: Dict[str, Set[str]] = defaultdict(set)
+        self.promoted_prompt_keys: Set[str] = set()
 
         self.kv_event_queue = []
 
-        if params.enable_metrics:
+        if params.enable_metrics and not self._is_personal_cache:
             self.init_metrics_collector()
 
         if self.token_to_kv_pool_allocator:
@@ -327,8 +341,17 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
     ##### Public API #####
 
     def reset(self):
+        if self._multi_tenant_enabled:
+            self.personal_caches.clear()
+            self.prompt_request_tracker.clear()
+            self.promoted_prompt_keys.clear()
+
+        self._reset_single_tree_state()
+
+    def _reset_single_tree_state(self):
         # Initialize root with minimum priority so any real priority overrides it
         self.root_node = TreeNode(priority=-sys.maxsize)
+        self.root_node.owner_cache = self
         self.root_node.key = RadixKey(token_ids=array("q"), extra_key=None)
         self.root_node.value = []
         self.root_node.host_value = []
@@ -350,6 +373,21 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         self._record_all_cleared_event()
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
+        if not self._multi_tenant_enabled:
+            return self._match_prefix_single(params)
+
+        user_id = self._resolve_user_id(params.user_id, params.req)
+        with self._state_lock:
+            if user_id is not None:
+                personal_cache = self.personal_caches.get(user_id)
+                if personal_cache is not None:
+                    personal_result = personal_cache._match_prefix_single(params)
+                    if self._has_match(personal_result):
+                        return personal_result
+
+            return self._match_prefix_single(params)
+
+    def _match_prefix_single(self, params: MatchPrefixParams) -> MatchResult:
         """Find the longest cached prefix of ``key`` in the radix tree.
 
         The logical namespace for prefix matching is determined by both the
@@ -410,6 +448,38 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         )
 
     def insert(self, params: InsertParams) -> InsertResult:
+        if not self._multi_tenant_enabled:
+            return self._insert_single(params)
+
+        user_id = self._resolve_user_id(params.user_id)
+        with self._state_lock:
+            if user_id is None:
+                return self._insert_single(params)
+
+            personal_cache = self._get_or_create_personal_cache(user_id)
+            personal_result = personal_cache._insert_single(params)
+
+            if params.track_miss_for_promotion:
+                prompt_key = self._build_prompt_tracker_key(params.key)
+                requestors = self.prompt_request_tracker[prompt_key]
+                requestors.add(user_id)
+                if (
+                    len(requestors) >= self.PROMOTION_THRESHOLD
+                    and prompt_key not in self.promoted_prompt_keys
+                ):
+                    self.promoted_prompt_keys.add(prompt_key)
+                    self._insert_single(
+                        InsertParams(
+                            key=params.key,
+                            value=params.value,
+                            chunked=params.chunked,
+                            priority=params.priority,
+                        )
+                    )
+
+            return personal_result
+
+    def _insert_single(self, params: InsertParams) -> InsertResult:
         if self.disable:
             return InsertResult(prefix_len=0)
 
@@ -462,9 +532,15 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
 
         # Radix Cache takes one ref in memory pool
         if is_insert:
-            priority = getattr(req, "priority", 0) or 0
+            priority = req.priority or 0
             result = self.insert(
-                InsertParams(key=radix_key, value=values, priority=priority)
+                InsertParams(
+                    key=radix_key,
+                    value=values,
+                    priority=priority,
+                    user_id=req.session_id,
+                    track_miss_for_promotion=req.num_matched_prefix_tokens == 0,
+                )
             )
             freed_end = result.prefix_len
         else:
@@ -506,7 +582,11 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
                 key=radix_key,
                 value=values,
                 chunked=chunked,
-                priority=getattr(req, "priority", 0) or 0,
+                priority=req.priority or 0,
+                user_id=req.session_id,
+                track_miss_for_promotion=(
+                    req.num_matched_prefix_tokens == 0 and req.cache_protected_len == 0
+                ),
             )
         )
         new_prefix_len = result.prefix_len
@@ -517,7 +597,9 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         )
 
         # The prefix indices could be updated, reuse it
-        match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
+        match_result = self.match_prefix(
+            MatchPrefixParams(key=radix_key, user_id=req.session_id)
+        )
         new_indices, new_last_node = (
             match_result.device_indices,
             match_result.last_device_node,
@@ -553,13 +635,33 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         req.last_node = new_last_node
 
     def pretty_print(self):
+        if self._multi_tenant_enabled:
+            print("global cache")
+            self._print_helper(self.root_node, 2)
+            for user_id, personal_cache in self.personal_caches.items():
+                print(f"personal cache user_id={user_id}")
+                personal_cache._print_helper(personal_cache.root_node, 2)
+            print(f"#tokens: {self.total_size()}")
+            return
+
         self._print_helper(self.root_node, 0)
         print(f"#tokens: {self.total_size()}")
 
     def total_size(self):
+        if self._multi_tenant_enabled:
+            total_size = self._total_size_helper()
+            for personal_cache in self.personal_caches.values():
+                total_size += personal_cache._total_size_helper()
+            return total_size
         return self._total_size_helper()
 
     def evict(self, params: EvictParams) -> EvictResult:
+        if self._multi_tenant_enabled:
+            return self._evict_multi_tenant(params)
+
+        return self._evict_single(params)
+
+    def _evict_single(self, params: EvictParams) -> EvictResult:
         if self.disable:
             return EvictResult()
 
@@ -589,7 +691,59 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         self.update_eviction_metrics(num_evicted, start_time)
         return EvictResult(num_tokens_evicted=num_evicted)
 
+    def _evict_multi_tenant(self, params: EvictParams) -> EvictResult:
+        if self.disable:
+            return EvictResult()
+
+        start_time = time.perf_counter()
+        num_tokens = params.num_tokens
+        num_evicted = 0
+
+        with self._state_lock:
+            eviction_heap = []
+            for cache in self._iter_all_trees():
+                for node in cache.evictable_leaves:
+                    heapq.heappush(
+                        eviction_heap,
+                        (cache.eviction_strategy.get_priority(node), node, cache),
+                    )
+
+            while num_evicted < num_tokens and eviction_heap:
+                _priority, node, owner_cache = heapq.heappop(eviction_heap)
+
+                if node.evicted or node.lock_ref > 0:
+                    continue
+
+                owner_cache.token_to_kv_pool_allocator.free_segment(node.value, start_pos=0)
+                num_evicted += len(node.value)
+                owner_cache._delete_leaf(node)
+
+                parent = node.parent
+                if parent is not None and len(parent.children) == 0 and parent.lock_ref == 0:
+                    heapq.heappush(
+                        eviction_heap,
+                        (
+                            owner_cache.eviction_strategy.get_priority(parent),
+                            parent,
+                            owner_cache,
+                        ),
+                    )
+
+                owner_cache._record_remove_event(node)
+
+        self.update_eviction_metrics(num_evicted, start_time)
+        return EvictResult(num_tokens_evicted=num_evicted)
+
     def inc_lock_ref(self, node: TreeNode) -> IncLockRefResult:
+        if self._multi_tenant_enabled:
+            owner_cache = node.owner_cache
+            if owner_cache is None:
+                return IncLockRefResult(delta=0)
+            return owner_cache._inc_lock_ref_single(node)
+
+        return self._inc_lock_ref_single(node)
+
+    def _inc_lock_ref_single(self, node: TreeNode) -> IncLockRefResult:
         if self.disable:
             return IncLockRefResult(delta=0)
 
@@ -607,6 +761,15 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
     def dec_lock_ref(
         self, node: TreeNode, params: Optional[DecLockRefParams] = None
     ) -> DecLockRefResult:
+        if self._multi_tenant_enabled:
+            owner_cache = node.owner_cache
+            if owner_cache is None:
+                return DecLockRefResult(delta=0)
+            return owner_cache._dec_lock_ref_single(node)
+
+        return self._dec_lock_ref_single(node)
+
+    def _dec_lock_ref_single(self, node: TreeNode) -> DecLockRefResult:
         if self.disable:
             return DecLockRefResult(delta=0)
 
@@ -619,20 +782,36 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             node.lock_ref -= 1
             self._update_leaf_status(node)
             if node.parent is None:
-                assert (
-                    node is self.root_node
-                ), "This request holds the node from another tree"
+                assert node is self.root_node, "This request holds the node from another tree"
             node = node.parent
         return DecLockRefResult(delta=delta)
 
     def evictable_size(self):
+        if self._multi_tenant_enabled:
+            total = self.evictable_size_
+            for personal_cache in self.personal_caches.values():
+                total += personal_cache.evictable_size_
+            return total
         return self.evictable_size_
 
     def protected_size(self):
         # protected size refers to the size of the cache that is locked
+        if self._multi_tenant_enabled:
+            total = self.protected_size_
+            for personal_cache in self.personal_caches.values():
+                total += personal_cache.protected_size_
+            return total
         return self.protected_size_
 
     def all_values_flatten(self):
+        if self._multi_tenant_enabled:
+            values = []
+            for cache in self._iter_all_trees():
+                for child in cache.root_node.children.values():
+                    values.append(child.value)
+                    cache._collect_values_dfs(child, values)
+            return torch.cat(values) if values else torch.empty((0,), dtype=torch.int64)
+
         values = []
 
         def _dfs_helper(node: TreeNode):
@@ -643,7 +822,57 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         _dfs_helper(self.root_node)
         return torch.cat(values)
 
+    def _collect_values_dfs(self, node: TreeNode, values: list):
+        for child in node.children.values():
+            values.append(child.value)
+            self._collect_values_dfs(child, values)
+
     ##### Internal Helper Functions #####
+
+    def _resolve_user_id(
+        self, explicit_user_id: Optional[str], req: Optional[Req] = None
+    ) -> Optional[str]:
+        if explicit_user_id is not None and explicit_user_id != "":
+            return explicit_user_id
+        if req is not None and req.session_id is not None and req.session_id != "":
+            return req.session_id
+        return None
+
+    def _has_match(self, result: MatchResult) -> bool:
+        return len(result.device_indices) > 0 or result.host_hit_length > 0
+
+    def _get_or_create_personal_cache(self, user_id: str) -> RadixCache:
+        personal_cache = self.personal_caches.get(user_id)
+        if personal_cache is not None:
+            return personal_cache
+
+        params = CacheInitParams(
+            disable=self.disable,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            page_size=self.page_size,
+            enable_kv_cache_events=self.enable_kv_cache_events,
+            enable_metrics=False,
+            is_eagle=self.is_eagle,
+            disable_finished_insert=self.disable_finished_insert,
+            eviction_policy=self.eviction_policy,
+        )
+        personal_cache = RadixCache(params, _is_personal_cache=True)
+        personal_cache.kv_event_queue = self.kv_event_queue
+        self.personal_caches[user_id] = personal_cache
+        return personal_cache
+
+    def _build_prompt_tracker_key(self, key: Optional[RadixKey]) -> str:
+        if key is None:
+            return ""
+
+        aligned_key, _ = key.maybe_to_bigram_view(self.is_eagle)
+        aligned_key = aligned_key.page_aligned(self.page_size)
+        token_ids = tuple(aligned_key.raw_token_ids())
+        return get_hash_str((aligned_key.extra_key, token_ids), None)
+
+    def _iter_all_trees(self) -> list[RadixCache]:
+        return [self] + list(self.personal_caches.values())
 
     def _match_prefix_helper(self, node: TreeNode, key: RadixKey):
         access_time = time.monotonic()
@@ -675,6 +904,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         # new_node -> child
         # New node inherits child's priority (represents shared prefix)
         new_node = TreeNode(priority=child.priority)
+        new_node.owner_cache = self
         new_node.hit_count = child.hit_count
         new_node.children = {key[split_len:].child_key(self.page_size): child}
         new_node.parent = child.parent
@@ -743,6 +973,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
 
         if len(key):
             new_node = TreeNode(priority=priority)
+            new_node.owner_cache = self
             new_node.parent = node
             new_node.key = key
             new_node.value = value.clone()

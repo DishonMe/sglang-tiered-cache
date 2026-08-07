@@ -1337,6 +1337,7 @@ class Req(ReqDllmMixin):
                     ),
                     req=self,
                     cow_mamba=cow_mamba,
+                    user_id=self.session_id,
                 )
             )
             if envs.SGLANG_RADIX_FORCE_MISS.get():
