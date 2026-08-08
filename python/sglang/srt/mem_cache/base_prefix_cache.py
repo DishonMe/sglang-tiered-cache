@@ -22,7 +22,8 @@ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 # Tenant label used when a request carries no explicit identity (raw /generate
 # API, anonymous OpenAI traffic). Anonymous requests share this tenant's
 # personal radix cache; the global tree stays reserved for promoted prefixes so
-# no request can write to it without crossing the promotion threshold.
+# no request can write to it without first meeting the multi-user promotion
+# odds.
 DEFAULT_TENANT_ID = "default"
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_RADIX_CACHE,

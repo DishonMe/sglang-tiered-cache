@@ -23,6 +23,7 @@ The radix tree data structure for managing the KV cache.
 
 import heapq
 import logging
+import random
 import sys
 import threading
 import time
@@ -282,7 +283,16 @@ class TreeNode:
 
 
 class RadixCache(KVCacheEventMixin, BasePrefixCache):
-    PROMOTION_THRESHOLD = 5
+    # A prompt is only promoted into the shared global cache once it has been
+    # requested by at least MIN_TO_RAISE distinct users. Beyond that the
+    # promotion is rolled probabilistically per tracked insert: with `n`
+    # distinct users the chance is (n - MIN_TO_RAISE) / PROMOTION_ODDS_WINDOW,
+    # i.e. 1% at MIN_TO_RAISE + 1, 2% at MIN_TO_RAISE + 2, ..., 100% at
+    # MIN_TO_RAISE + PROMOTION_ODDS_WINDOW. A low-frequency prompt requested by
+    # one user thus stays invisible (a full cache miss) to everyone else while
+    # a globally-popular prompt eventually becomes a public cache hit.
+    MIN_TO_RAISE = 5
+    PROMOTION_ODDS_WINDOW = 100
 
     def __init__(self, params: CacheInitParams, *, _is_personal_cache: bool = False):
         self.disable = params.disable
@@ -577,9 +587,8 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
                 prompt_key = self._build_prompt_tracker_key(params.key)
                 requestors = self.prompt_request_tracker[prompt_key]
                 requestors.add(user_id)
-                threshold = self._get_promotion_threshold()
                 if (
-                    len(requestors) >= threshold
+                    self._should_promote(len(requestors))
                     and prompt_key not in self.promoted_prompt_keys
                 ):
                     self.promoted_prompt_keys.add(prompt_key)
@@ -977,7 +986,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
                 return req.session_id
         # No identity at all (e.g. raw /generate requests): fall back to the
         # anonymous tenant so no request can write to or probe the global tree
-        # without crossing the promotion threshold.
+        # without first meeting the multi-user promotion odds.
         return DEFAULT_TENANT_ID
 
     def _has_match(self, result: MatchResult) -> bool:
@@ -1019,14 +1028,35 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         token_ids = tuple(normalized_key.raw_token_ids())
         return (normalized_key.extra_key, normalized_key.is_bigram, token_ids)
 
-    def _get_promotion_threshold(self) -> int:
-        threshold = self.PROMOTION_THRESHOLD
-        if threshold is None:
+    def _get_min_to_raise(self) -> int:
+        min_to_raise = self.MIN_TO_RAISE
+        if min_to_raise is None:
             return 5
-        threshold = int(threshold)
-        if threshold <= 0:
+        min_to_raise = int(min_to_raise)
+        if min_to_raise <= 0:
             return 1
-        return threshold
+        return min_to_raise
+
+    def _should_promote(self, num_requestors: int) -> bool:
+        """Whether `num_requestors` distinct users suffice to promote a prompt.
+
+        Below MIN_TO_RAISE distinct users a prompt is never promoted. Above
+        that, promotion is rolled on each tracked insert with probability
+        (num_requestors - MIN_TO_RAISE) / PROMOTION_ODDS_WINDOW. This is the
+        exact equivalent of rolling a uniform integer in (MIN_TO_RAISE,
+        MIN_TO_RAISE + PROMOTION_ODDS_WINDOW] and promoting only when the roll
+        is <= num_requestors: 1% at MIN_TO_RAISE + 1, 2% at MIN_TO_RAISE + 2,
+        ..., 100% at MIN_TO_RAISE + PROMOTION_ODDS_WINDOW.
+        """
+        min_to_raise = self._get_min_to_raise()
+        if num_requestors <= min_to_raise:
+            return False
+        if num_requestors >= min_to_raise + self.PROMOTION_ODDS_WINDOW:
+            return True
+        return (
+            random.random()
+            < (num_requestors - min_to_raise) / self.PROMOTION_ODDS_WINDOW
+        )
 
     def _iter_all_trees(self) -> list[RadixCache]:
         return [self] + list(self.personal_caches.values())
