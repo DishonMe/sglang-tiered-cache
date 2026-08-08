@@ -33,6 +33,12 @@ class CacheInitParams:
     enable_kv_cache_events: bool = False
     enable_session_radix_cache: bool = False
 
+    # Multi-tenant radix cache: requests are keyed by user_id, with a shared
+    # global cache whose prompts are promoted only after enough distinct users
+    # request them. Debug-log the per-request global_match_len / truncation.
+    enable_multi_tenant_cache: bool = False
+    enable_radix_cache_debug_log: bool = False
+
     enable_mamba_extra_buffer: bool = False
     enable_mamba_extra_buffer_lazy: bool = False
 

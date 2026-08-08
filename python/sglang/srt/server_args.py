@@ -923,6 +923,23 @@ class ServerArgs:
     disable_radix_cache: A[
         bool, "Disable RadixAttention for prefix caching.", NS("memory")
     ] = False
+    enable_multi_tenant_cache: A[
+        bool,
+        "Enable the multi-tenant radix cache: KV entries are keyed by the "
+        "request's user_id (or session_id), and a prompt is only promoted into "
+        "the shared global cache after it has been requested by "
+        "--promotion-threshold distinct users. Keeps a low-frequency prompt "
+        "requested by one user invisible (a full cache miss) to every other "
+        "user. Defaults to disabled (single shared cache).",
+        NS("memory"),
+    ] = False
+    enable_radix_cache_debug_log: A[
+        bool,
+        "Print [DBG] lines from the multi-tenant radix cache: per-request "
+        "user_id, key_len, global_match_len, and whether an insert was fully "
+        "served by the global cache or truncated to a personal-cache suffix.",
+        NS("observability"),
+    ] = False
     enable_page_major_kv_layout: A[
         bool,
         "Enable the page-major KV layout: lay out the Mamba state and full/SWA "
