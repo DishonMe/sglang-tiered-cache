@@ -32,6 +32,7 @@ import torch
 
 from sglang.srt.disaggregation.kv_events import BlockRemoved, BlockStored
 from sglang.srt.mem_cache.base_prefix_cache import (
+    DEFAULT_TENANT_ID,
     EvictParams,
     EvictResult,
     InsertParams,
@@ -533,27 +534,87 @@ class TestRadixCache(unittest.TestCase):
         This guards the two-tier lookup contract. A future refactor that checks
         the global cache first would silently leak cross-tenant timing benefits
         and return the wrong KV mapping for users with personal entries.
+
+        It also guards the write-side invariant: no insert -- with or without a
+        user_id -- may write to the global tree directly. Anonymous inserts land
+        in the default tenant's personal cache and only reach the global tree
+        via the promotion path.
         """
-        cache = RadixCache.create_simulated()
+        cache = RadixCache.create_simulated(enable_multi_tenant_cache=True)
         key = RadixKey(array("q", [1, 2, 3, 4]))
 
-        global_value = torch.tensor([10, 20, 30, 40], dtype=torch.int64)
         personal_value = torch.tensor([110, 120, 130, 140], dtype=torch.int64)
+        anon_value = torch.tensor([10, 20, 30, 40], dtype=torch.int64)
 
-        # Legacy/global insertion path (no user_id).
-        cache.insert(InsertParams(key=key, value=global_value))
         # Tenant-scoped insertion path.
         cache.insert(InsertParams(key=key, value=personal_value, user_id="user-a"))
+        # Anonymous insertion path (no user_id): must NOT reach the global tree.
+        cache.insert(InsertParams(key=key, value=anon_value))
 
         user_a_match = cache.match_prefix(
             MatchPrefixParams(key=RadixKey(array("q", [1, 2, 3, 4])), user_id="user-a")
         )
         torch.testing.assert_close(user_a_match.device_indices, personal_value)
 
+        # user-b sees nothing: neither a personal entry nor any global write.
         user_b_match = cache.match_prefix(
             MatchPrefixParams(key=RadixKey(array("q", [1, 2, 3, 4])), user_id="user-b")
         )
-        torch.testing.assert_close(user_b_match.device_indices, global_value)
+        self.assertEqual(len(user_b_match.device_indices), 0)
+
+        # The anonymous insert landed in the default tenant's personal cache.
+        anon_match = cache.match_prefix(
+            MatchPrefixParams(
+                key=RadixKey(array("q", [1, 2, 3, 4])), user_id=DEFAULT_TENANT_ID
+            )
+        )
+        torch.testing.assert_close(anon_match.device_indices, anon_value)
+
+    def test_tenant_promotion_lifecycle_first_five_miss_then_global(self):
+        """Spec semantics end-to-end:
+
+        - the first 5 distinct users each MISS (no cache hit) on a new prompt;
+        - a same-user repeat HITS the personal cache even before promotion;
+        - after 5 distinct users miss, any other user HITS via the global cache.
+        """
+        cache = RadixCache.create_simulated(enable_multi_tenant_cache=True)
+        tokens = array("q", [1, 2, 3, 4, 5])
+        key = RadixKey(tokens)
+        value = torch.tensor([11, 22, 33, 44, 55], dtype=torch.int64)
+
+        def lookup(user_id):
+            return cache.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", [1, 2, 3, 4, 5])), user_id=user_id)
+            ).device_indices
+
+        def miss_insert(user_id):
+            cache.insert(
+                InsertParams(
+                    key=key,
+                    value=value,
+                    user_id=user_id,
+                    track_miss_for_promotion=True,
+                )
+            )
+
+        miss_insert("user-0")
+        # Repeat by the same user hits the personal cache before the threshold.
+        self.assertEqual(len(lookup("user-0")), 5)
+
+        # The first 5 distinct users get NO cache hit on their first request.
+        for i in range(1, 5):
+            self.assertEqual(
+                len(lookup(f"user-{i}")), 0, f"user-{i} must not hit before promotion"
+            )
+            miss_insert(f"user-{i}")
+
+        # Threshold reached: any other request is served by the global cache.
+        post = lookup("user-zzz")
+        self.assertEqual(len(post), 5)
+        torch.testing.assert_close(post, value)
+
+        # The promoted prompt is also visible to one of the first five users.
+        self.assertEqual(len(lookup("user-3")), 5)
 
     def test_tenant_promotion_requires_threshold_unique_users(self):
         """Derived property: global promotion requires 5 unique miss users.
@@ -562,7 +623,7 @@ class TestRadixCache(unittest.TestCase):
         promotion tracking. Regressions here could re-enable side-channel
         amplification via premature global visibility.
         """
-        cache = RadixCache.create_simulated()
+        cache = RadixCache.create_simulated(enable_multi_tenant_cache=True)
         key = RadixKey(array("q", [7, 8, 9, 10]))
         value = torch.tensor([70, 80, 90, 100], dtype=torch.int64)
 
@@ -602,7 +663,7 @@ class TestRadixCache(unittest.TestCase):
         future diff increments the tracker on cache hits, this test turns red by
         promoting to global with fewer than 5 miss users.
         """
-        cache = RadixCache.create_simulated()
+        cache = RadixCache.create_simulated(enable_multi_tenant_cache=True)
         key = RadixKey(array("q", [21, 22, 23, 24]))
         value = torch.tensor([210, 220, 230, 240], dtype=torch.int64)
 
@@ -652,6 +713,110 @@ class TestRadixCache(unittest.TestCase):
             MatchPrefixParams(key=RadixKey(array("q", [21, 22, 23, 24])), user_id="user-z")
         )
         torch.testing.assert_close(promoted_match.device_indices, value)
+
+    def test_tenant_promotion_transfers_ownership_to_global(self):
+        """Rework invariant: after promotion, the promoted slots are owned by the
+        global tree only.
+
+        The triggering personal node is detached (without freeing its slots), and
+        later requests fully served by the global tree must not duplicate those
+        slots into a personal cache. Guards against double-owned KV slots that a
+        non-ref-counted allocator would double-free under eviction.
+        """
+        cache = RadixCache.create_simulated(enable_multi_tenant_cache=True)
+        tokens = array("q", [1, 2, 3, 4])
+        key = RadixKey(tokens)
+        value = torch.tensor([11, 22, 33, 44], dtype=torch.int64)
+
+        def miss_insert(user_id):
+            cache.insert(
+                InsertParams(
+                    key=key,
+                    value=value,
+                    user_id=user_id,
+                    track_miss_for_promotion=True,
+                )
+            )
+
+        for i in range(5):
+            miss_insert(f"user-{i}")
+
+        # The 5th user's personal cache no longer holds a copy.
+        self.assertEqual(cache.personal_caches["user-4"]._total_size_helper(), 0)
+
+        # A request fully served by the global tree must not duplicate the slots
+        # into a personal cache (the personal cache is not even created).
+        cache.insert(
+            InsertParams(
+                key=key,
+                value=value,
+                user_id="user-5",
+                track_miss_for_promotion=False,
+            )
+        )
+        self.assertNotIn("user-5", cache.personal_caches)
+
+        # The promoted prompt is reachable through the global tier for any user.
+        for user_id in ["user-4", "user-zzz"]:
+            hit = cache.match_prefix(
+                MatchPrefixParams(key=RadixKey(tokens), user_id=user_id)
+            )
+            torch.testing.assert_close(hit.device_indices, value)
+
+        # The global tree owns the content exactly once.
+        self.assertEqual(len(cache.root_node.children), 1)
+
+    def test_tenant_promotion_guard_purged_on_global_eviction(self):
+        """The promotion guard must be cleared when the promoted node's slots leave
+        the global tree, so the prompt can be promoted again on future full misses.
+        """
+        cache = RadixCache.create_simulated(
+            mock_allocator=unittest.mock.Mock(device=torch.device("cpu")),
+            enable_multi_tenant_cache=True,
+        )
+        tokens = array("q", [1, 2, 3, 4])
+        key = RadixKey(tokens)
+        value = torch.tensor([11, 22, 33, 44], dtype=torch.int64)
+
+        for i in range(5):
+            cache.insert(
+                InsertParams(
+                    key=key,
+                    value=value,
+                    user_id=f"user-{i}",
+                    track_miss_for_promotion=True,
+                )
+            )
+        prompt_key = cache._build_prompt_tracker_key(key)
+        self.assertIn(prompt_key, cache.promoted_prompt_keys)
+
+        # A fully-global hit (6th user) must not mutate the guard.
+        cache.insert(
+            InsertParams(
+                key=key,
+                value=value,
+                user_id="user-5",
+                track_miss_for_promotion=False,
+            )
+        )
+        self.assertIn(prompt_key, cache.promoted_prompt_keys)
+
+        # Evict everything: the promoted node's slots are freed, so the guard is
+        # purged and the prompt becomes eligible for promotion again.
+        cache.evict(EvictParams(num_tokens=100))
+        self.assertNotIn(prompt_key, cache.promoted_prompt_keys)
+
+        # A fresh distinct user can now promote the prompt again.
+        cache.insert(
+            InsertParams(
+                key=key,
+                value=value,
+                user_id="user-6",
+                track_miss_for_promotion=True,
+            )
+        )
+        self.assertIn(prompt_key, cache.promoted_prompt_keys)
+        self.assertEqual(len(cache.promoted_prompt_node_ids), 1)
 
     def test_lock_ref_operations(self):
         """Test lock reference counting operations."""
