@@ -2099,6 +2099,7 @@ class MMReceiverBase(ABC):
             token_ids_logprob=recv_req.token_ids_logprob,
             stream=recv_req.stream,
             lora_id=recv_req.lora_id,
+            user_id=recv_req.user_id,
             input_embeds=recv_req.input_embeds,
             custom_logit_processor=recv_req.custom_logit_processor,
             require_reasoning=recv_req.require_reasoning,

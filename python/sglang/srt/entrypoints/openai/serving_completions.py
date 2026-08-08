@@ -14,6 +14,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     CompletionResponseChoice,
     CompletionResponseStreamChoice,
     CompletionStreamResponse,
+    DEFAULT_TENANT_ID,
     ErrorResponse,
     SglExt,
 )
@@ -128,6 +129,12 @@ class OpenAIServingCompletion(OpenAIServingBase):
             return_prompt_token_ids=request.return_token_ids,
             rid=request.rid,
             session_id=request.session_id,
+            user_id=(
+                request.tenant_id
+                or request.user
+                or request.session_id
+                or DEFAULT_TENANT_ID
+            ),
             extra_key=self._compute_extra_key(request),
             priority=request.priority,
             routing_key=self.extract_routing_key(raw_request),

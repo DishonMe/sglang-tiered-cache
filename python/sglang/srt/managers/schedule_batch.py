@@ -831,6 +831,7 @@ class Req(ReqDllmMixin):
         return_pooled_hidden_states: bool = False,
         multi_item_delimiter_indices: Optional[List[int]] = None,
         session_id: Optional[str] = None,
+        user_id: Optional[str] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -854,6 +855,9 @@ class Req(ReqDllmMixin):
 
         self.session = session
         self.session_id = session_id
+        # Tenant/end-user identity scoping the radix cache into per-user
+        # personal caches. Preferred over session_id when both are set.
+        self.user_id = user_id
         # Used by the session radix cache to reject registration after a close/reopen.
         self.session_generation: Optional[int] = None
         self.input_embeds = input_embeds
@@ -1337,7 +1341,7 @@ class Req(ReqDllmMixin):
                     ),
                     req=self,
                     cow_mamba=cow_mamba,
-                    user_id=self.session_id,
+                    user_id=self.user_id or self.session_id,
                 )
             )
             if envs.SGLANG_RADIX_FORCE_MISS.get():

@@ -56,6 +56,7 @@ from sglang.srt.entrypoints.harmony_utils import (
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageParam,
     ChatCompletionRequest,
+    DEFAULT_TENANT_ID,
     Function,
     MessageProcessingResult,
     PromptTokenUsageInfo,
@@ -369,6 +370,12 @@ class OpenAIServingResponses(OpenAIServingChat):
                         stream=request.stream,
                         rid=request.request_id,
                         session_id=request.session_id,
+                        user_id=(
+                            request.tenant_id
+                            or request.user
+                            or request.session_id
+                            or DEFAULT_TENANT_ID
+                        ),
                         extra_key=self._compute_extra_key(request),
                         background=request.background,
                         require_reasoning=require_reasoning,
@@ -2404,6 +2411,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 stream=adapted_request.stream,
                 rid=request_id,
                 session_id=adapted_request.session_id,
+                user_id=adapted_request.user_id,
                 extra_key=adapted_request.extra_key,
                 return_logprob=adapted_request.return_logprob,
                 logprob_start_len=adapted_request.logprob_start_len,

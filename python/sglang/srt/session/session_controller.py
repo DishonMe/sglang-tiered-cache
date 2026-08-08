@@ -297,6 +297,7 @@ class Session:
             sampling_params=req.sampling_params,
             lora_id=req.lora_id,
             session=self,
+            user_id=req.user_id,
             custom_logit_processor=req.custom_logit_processor,
             stream=req.stream,
             return_logprob=req.return_logprob,

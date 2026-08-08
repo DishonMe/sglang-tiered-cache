@@ -165,6 +165,10 @@ class GenerateReqInput:
     # Stable identity shared by requests in the same session. Unlike
     # session_params, this does not alter or reconstruct the prompt.
     session_id: Optional[str] = field(default=None, kw_only=True)
+    # Tenant/end-user identity used to scope the radix cache into per-user
+    # personal caches. When unset, the serving layer falls back to the default
+    # tenant so requests never bypass the tenant cache into the global tree.
+    user_id: Optional[str] = field(default=None, kw_only=True)
     # The input prompt. It can be a single prompt or a batch of prompts.
     text: Optional[Union[List[str], str]] = None
     # The token ids for text.
@@ -764,6 +768,7 @@ class GenerateReqInput:
         sub = GenerateReqInput(
             rid=self.rid[logical_index],
             session_id=self.session_id,
+            user_id=self.user_id,
             text=self.text[i] if self.text is not None else None,
             input_ids=self.input_ids[i] if self.input_ids is not None else None,
             input_embeds=(
@@ -884,6 +889,10 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # Session info for continual prompting
     session_id: Optional[str] = None
     session_params: Optional[SessionParams] = None
+
+    # Tenant/end-user identity scoping the radix cache into per-user personal
+    # caches. See GenerateReqInput.user_id.
+    user_id: Optional[str] = None
 
     # LoRA related
     lora_id: Optional[str] = None  # None means just use the base model

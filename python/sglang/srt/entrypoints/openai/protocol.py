@@ -65,6 +65,13 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL_NAME = "default"
 
+# Tenant label used when a request does not carry an explicit `user`. Anonymous
+# requests share this tenant's personal radix cache; the global cache stays
+# reserved for promoted (multi-user) prefixes.
+# NOTE: keep in sync with sglang.srt.mem_cache.base_prefix_cache.DEFAULT_TENANT_ID
+# (canonical home) -- this module cannot import it without a circular import.
+DEFAULT_TENANT_ID = "default"
+
 
 class ModelCard(BaseModel):
     """Model cards."""
@@ -360,6 +367,9 @@ class CompletionRequest(BaseModel):
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
     session_id: Optional[str] = None
     session_params: Optional[Dict] = None
+    # SGLang extension: explicit tenant/end-user identity for the per-user radix
+    # cache. Takes precedence over the OpenAI-standard `user` field.
+    tenant_id: Optional[str] = None
     response_format: Optional[Union[ResponseFormat, StructuralTagResponseFormat]] = None
     custom_params: Optional[Dict] = None
     custom_logit_processor: Optional[str] = None
@@ -817,6 +827,9 @@ class ChatCompletionRequest(BaseModel):
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
     session_id: Optional[str] = None
     session_params: Optional[Dict] = None
+    # SGLang extension: explicit tenant/end-user identity for the per-user radix
+    # cache. Takes precedence over the OpenAI-standard `user` field.
+    tenant_id: Optional[str] = None
     separate_reasoning: bool = True
     stream_reasoning: bool = True
     chat_template_kwargs: Optional[Dict] = None
@@ -1522,6 +1535,9 @@ class ResponsesRequest(BaseModel):
         description="The request_id related to this request. If the caller does not set it, a random uuid will be generated.",
     )
     session_id: Optional[str] = None
+    # SGLang extension: explicit tenant/end-user identity for the per-user radix
+    # cache. Takes precedence over the OpenAI-standard `user` field.
+    tenant_id: Optional[str] = None
     priority: int = Field(default=0, description="Request priority")
     extra_key: Optional[str] = Field(
         default=None,

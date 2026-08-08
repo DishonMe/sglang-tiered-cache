@@ -35,6 +35,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionTokenLogprob,
     ChatMessage,
     ChoiceLogprobs,
+    DEFAULT_TENANT_ID,
     DeltaMessage,
     ErrorResponse,
     FunctionResponse,
@@ -1009,6 +1010,12 @@ class OpenAIServingChat(OpenAIServingBase):
             routed_experts_start_len=request.routed_experts_start_len,
             rid=request.rid,
             session_id=request.session_id,
+            user_id=(
+                request.tenant_id
+                or request.user
+                or request.session_id
+                or DEFAULT_TENANT_ID
+            ),
             extra_key=self._compute_extra_key(request),
             require_reasoning=processed_messages.require_reasoning,
             priority=request.priority,
