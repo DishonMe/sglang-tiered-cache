@@ -570,12 +570,12 @@ class TestRadixCache(unittest.TestCase):
         )
         torch.testing.assert_close(anon_match.device_indices, anon_value)
 
-    def test_tenant_promotion_lifecycle_first_five_miss_then_global(self):
-        """Spec semantics end-to-end:
+    def test_tenant_promotion_never_before_min_to_raise(self):
+        """The MIN_TO_RAISE floor is absolute: a prompt cannot be promoted
+        before MIN_TO_RAISE distinct users have requested it, even when a
+        promotion roll would otherwise win.
 
-        - the first 5 distinct users each MISS (no cache hit) on a new prompt;
-        - a same-user repeat HITS the personal cache even before promotion;
-        - after 5 distinct users miss, any other user HITS via the global cache.
+        A same-user repeat hits the personal cache before the floor.
         """
         cache = RadixCache.create_simulated(enable_multi_tenant_cache=True)
         tokens = array("q", [1, 2, 3, 4, 5])
@@ -584,7 +584,7 @@ class TestRadixCache(unittest.TestCase):
 
         def lookup(user_id):
             return cache.match_prefix(
-                MatchPrefixParams(key=RadixKey(array("q", [1, 2, 3, 4, 5])), user_id=user_id)
+                MatchPrefixParams(key=RadixKey(tokens), user_id=user_id)
             ).device_indices
 
         def miss_insert(user_id):
@@ -598,72 +598,103 @@ class TestRadixCache(unittest.TestCase):
             )
 
         miss_insert("user-0")
-        # Repeat by the same user hits the personal cache before the threshold.
+        # A same-user repeat hits the personal cache before promotion.
         self.assertEqual(len(lookup("user-0")), 5)
 
-        # The first 5 distinct users get NO cache hit on their first request.
-        for i in range(1, 5):
-            self.assertEqual(
-                len(lookup(f"user-{i}")), 0, f"user-{i} must not hit before promotion"
-            )
-            miss_insert(f"user-{i}")
+        # Force every promotion roll to win: still nothing below the floor.
+        with unittest.mock.patch(
+            "sglang.srt.mem_cache.radix_cache.random.random", return_value=0.0
+        ):
+            for i in range(1, 5):
+                self.assertEqual(
+                    len(lookup(f"user-{i}")), 0, f"user-{i} must not hit before promotion"
+                )
+                miss_insert(f"user-{i}")
+            # Exactly MIN_TO_RAISE distinct users: the floor itself never raises.
+            self.assertEqual(len(lookup("user-zzz")), 0)
 
-        # Threshold reached: any other request is served by the global cache.
-        post = lookup("user-zzz")
-        self.assertEqual(len(post), 5)
-        torch.testing.assert_close(post, value)
-
-        # The promoted prompt is also visible to one of the first five users.
-        self.assertEqual(len(lookup("user-3")), 5)
-
-    def test_tenant_promotion_requires_threshold_unique_users(self):
-        """Derived property: global promotion requires 5 unique miss users.
-
-        This guards the admission threshold and uniqueness semantics for
-        promotion tracking. Regressions here could re-enable side-channel
-        amplification via premature global visibility.
+    def test_tenant_promotion_lifecycle_winning_roll_promotes_globally(self):
+        """End-to-end: the first MIN_TO_RAISE distinct users each miss on a new
+        prompt, then a winning roll on the next distinct user promotes it so any
+        later user is served by the global cache (and the first users see it).
         """
         cache = RadixCache.create_simulated(enable_multi_tenant_cache=True)
-        key = RadixKey(array("q", [7, 8, 9, 10]))
-        value = torch.tensor([70, 80, 90, 100], dtype=torch.int64)
+        tokens = array("q", [1, 2, 3, 4, 5])
+        key = RadixKey(tokens)
+        value = torch.tensor([11, 22, 33, 44, 55], dtype=torch.int64)
 
-        for i in range(4):
+        def lookup(user_id):
+            return cache.match_prefix(
+                MatchPrefixParams(key=RadixKey(tokens), user_id=user_id)
+            ).device_indices
+
+        def miss_insert(user_id):
             cache.insert(
                 InsertParams(
                     key=key,
                     value=value,
-                    user_id=f"user-{i}",
+                    user_id=user_id,
                     track_miss_for_promotion=True,
                 )
             )
 
-        pre_threshold_match = cache.match_prefix(
-            MatchPrefixParams(key=RadixKey(array("q", [7, 8, 9, 10])), user_id="user-x")
-        )
-        self.assertEqual(len(pre_threshold_match.device_indices), 0)
+        floor = cache._get_min_to_raise()
+        # The first MIN_TO_RAISE distinct users get no cache hit.
+        for i in range(floor):
+            self.assertEqual(len(lookup(f"user-{i}")), 0)
+            miss_insert(f"user-{i}")
 
-        cache.insert(
-            InsertParams(
-                key=key,
-                value=value,
-                user_id="user-4",
-                track_miss_for_promotion=True,
-            )
-        )
+        # Force a winning roll: the floor+1-th user's insert promotes the prompt.
+        with unittest.mock.patch(
+            "sglang.srt.mem_cache.radix_cache.random.random", return_value=0.0
+        ):
+            miss_insert("user-trigger")
 
-        post_threshold_match = cache.match_prefix(
-            MatchPrefixParams(key=RadixKey(array("q", [7, 8, 9, 10])), user_id="user-x")
-        )
-        torch.testing.assert_close(post_threshold_match.device_indices, value)
+        # Any later user is served by the global cache; the first users see it.
+        post = lookup("user-zzz")
+        self.assertEqual(len(post), 5)
+        torch.testing.assert_close(post, value)
+        self.assertEqual(len(lookup("user-3")), 5)
 
-    def test_tenant_promotion_does_not_advance_on_hits(self):
-        """Derived property: hit-path inserts must not count toward promotion.
-
-        This distinguishes miss-driven promotion from normal hit writes. If a
-        future diff increments the tracker on cache hits, this test turns red by
-        promoting to global with fewer than 5 miss users.
+    def test_tenant_promotion_ramps_with_distinct_users(self):
+        """After MIN_TO_RAISE distinct users the promotion odds ramp 1% per
+        additional distinct user, and are guaranteed at MIN_TO_RAISE +
+        PROMOTION_ODDS_WINDOW (the upper bound of the dice roll).
         """
         cache = RadixCache.create_simulated(enable_multi_tenant_cache=True)
+        floor = cache._get_min_to_raise()
+        window = cache.PROMOTION_ODDS_WINDOW
+
+        # Below the floor, even a guaranteed-winning roll never promotes.
+        with unittest.mock.patch(
+            "sglang.srt.mem_cache.radix_cache.random.random", return_value=0.0
+        ):
+            self.assertFalse(cache._should_promote(floor))
+
+        # At floor + 1 the chance is 1/100: 0.005 wins, 0.05 loses.
+        with unittest.mock.patch(
+            "sglang.srt.mem_cache.radix_cache.random.random", return_value=0.005
+        ):
+            self.assertTrue(cache._should_promote(floor + 1))
+        with unittest.mock.patch(
+            "sglang.srt.mem_cache.radix_cache.random.random", return_value=0.05
+        ):
+            self.assertFalse(cache._should_promote(floor + 1))
+
+        # From floor + window on, promotion is guaranteed for any roll.
+        with unittest.mock.patch(
+            "sglang.srt.mem_cache.radix_cache.random.random", return_value=0.9999
+        ):
+            self.assertTrue(cache._should_promote(floor + window))
+            self.assertTrue(cache._should_promote(floor + window + 50))
+
+    def test_tenant_promotion_requires_min_unique_miss_users(self):
+        """Global promotion requires MIN_TO_RAISE unique miss users: hit-path
+        inserts must not count toward promotion, and the floor itself never
+        raises (a winning roll only starts at floor + 1).
+        """
+        cache = RadixCache.create_simulated(enable_multi_tenant_cache=True)
+        floor = cache._get_min_to_raise()
         key = RadixKey(array("q", [21, 22, 23, 24]))
         value = torch.tensor([210, 220, 230, 240], dtype=torch.int64)
 
@@ -676,7 +707,7 @@ class TestRadixCache(unittest.TestCase):
             )
         )
 
-        # Simulate a hit-path write: it must not be counted for promotion.
+        # A hit-path write (track_miss_for_promotion=False) must not count.
         cache.insert(
             InsertParams(
                 key=key,
@@ -696,23 +727,46 @@ class TestRadixCache(unittest.TestCase):
                 )
             )
 
-        not_promoted_match = cache.match_prefix(
-            MatchPrefixParams(key=RadixKey(array("q", [21, 22, 23, 24])), user_id="user-z")
-        )
-        self.assertEqual(len(not_promoted_match.device_indices), 0)
+        def lookup(user_id):
+            return cache.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", [21, 22, 23, 24])), user_id=user_id)
+            ).device_indices
 
-        cache.insert(
-            InsertParams(
-                key=key,
-                value=value,
-                user_id="user-f",
-                track_miss_for_promotion=True,
+        # With a guaranteed-winning roll, MIN_TO_RAISE unique misses are still
+        # required: only floor - 1 tracked users so far, so no promotion.
+        with unittest.mock.patch(
+            "sglang.srt.mem_cache.radix_cache.random.random", return_value=0.0
+        ):
+            self.assertEqual(len(lookup("user-z")), 0)
+
+            # Reaching the floor does not raise yet...
+            cache.insert(
+                InsertParams(
+                    key=key,
+                    value=value,
+                    user_id="user-f",
+                    track_miss_for_promotion=True,
+                )
             )
+            self.assertEqual(len(lookup("user-z")), 0)
+
+            # ...the floor + 1-th unique miss user gets the winning roll.
+            cache.insert(
+                InsertParams(
+                    key=key,
+                    value=value,
+                    user_id="user-g",
+                    track_miss_for_promotion=True,
+                )
+            )
+            torch.testing.assert_close(lookup("user-z"), value)
+
+        # The tracker counted exactly floor + 1 unique miss users (user-b was a
+        # hit-path write and never entered the tracker).
+        self.assertEqual(
+            len(cache.prompt_request_tracker[cache._build_prompt_tracker_key(key)]),
+            floor + 1,
         )
-        promoted_match = cache.match_prefix(
-            MatchPrefixParams(key=RadixKey(array("q", [21, 22, 23, 24])), user_id="user-z")
-        )
-        torch.testing.assert_close(promoted_match.device_indices, value)
 
     def test_tenant_promotion_transfers_ownership_to_global(self):
         """Rework invariant: after promotion, the promoted slots are owned by the
@@ -724,6 +778,7 @@ class TestRadixCache(unittest.TestCase):
         non-ref-counted allocator would double-free under eviction.
         """
         cache = RadixCache.create_simulated(enable_multi_tenant_cache=True)
+        floor = cache._get_min_to_raise()
         tokens = array("q", [1, 2, 3, 4])
         key = RadixKey(tokens)
         value = torch.tensor([11, 22, 33, 44], dtype=torch.int64)
@@ -738,26 +793,32 @@ class TestRadixCache(unittest.TestCase):
                 )
             )
 
-        for i in range(5):
-            miss_insert(f"user-{i}")
+        # Force a winning roll so the floor+1-th user triggers the promotion.
+        with unittest.mock.patch(
+            "sglang.srt.mem_cache.radix_cache.random.random", return_value=0.0
+        ):
+            for i in range(floor + 1):
+                miss_insert(f"user-{i}")
 
-        # The 5th user's personal cache no longer holds a copy.
-        self.assertEqual(cache.personal_caches["user-4"]._total_size_helper(), 0)
-
-        # A request fully served by the global tree must not duplicate the slots
-        # into a personal cache (the personal cache is not even created).
-        cache.insert(
-            InsertParams(
-                key=key,
-                value=value,
-                user_id="user-5",
-                track_miss_for_promotion=False,
+            # The triggering user's personal cache no longer holds a copy.
+            self.assertEqual(
+                cache.personal_caches[f"user-{floor}"]._total_size_helper(), 0
             )
-        )
-        self.assertNotIn("user-5", cache.personal_caches)
+
+            # A request fully served by the global tree must not duplicate the
+            # slots into a personal cache (the personal cache is not created).
+            cache.insert(
+                InsertParams(
+                    key=key,
+                    value=value,
+                    user_id="user-later",
+                    track_miss_for_promotion=False,
+                )
+            )
+        self.assertNotIn("user-later", cache.personal_caches)
 
         # The promoted prompt is reachable through the global tier for any user.
-        for user_id in ["user-4", "user-zzz"]:
+        for user_id in ["user-3", "user-zzz"]:
             hit = cache.match_prefix(
                 MatchPrefixParams(key=RadixKey(tokens), user_id=user_id)
             )
@@ -765,6 +826,76 @@ class TestRadixCache(unittest.TestCase):
 
         # The global tree owns the content exactly once.
         self.assertEqual(len(cache.root_node.children), 1)
+
+    def test_tenant_promotion_counts_truncated_global_match_inserts(self):
+        """Regression: a prompt that only PARTIALLY matches the global tree must
+        still be tracked toward promotion.
+
+        When the global tree already owns a shared prefix (e.g. a chat template),
+        a new prompt sharing that prefix is stored as a truncated insert (only the
+        suffix reaches the personal cache) and the old full-miss-only tracker never
+        counted it, so the prompt could not be promoted no matter how many distinct
+        users requested it. The truncated insert path must feed the tracker and
+        promote the suffix below the existing global prefix.
+        """
+        cache = RadixCache.create_simulated(enable_multi_tenant_cache=True)
+        floor = cache._get_min_to_raise()
+
+        # First, promote a "template + secret-A" prompt so the global tree owns a
+        # shared prefix that later prompts will partially match.
+        template_key = RadixKey(array("q", [1, 2, 3, 4, 5]))
+        template_value = torch.tensor([11, 22, 33, 44, 55], dtype=torch.int64)
+        with unittest.mock.patch(
+            "sglang.srt.mem_cache.radix_cache.random.random", return_value=0.0
+        ):
+            for i in range(floor + 1):
+                cache.insert(
+                    InsertParams(
+                        key=template_key,
+                        value=template_value,
+                        user_id=f"template-{i}",
+                        track_miss_for_promotion=True,
+                    )
+                )
+        self.assertIn(
+            cache._build_prompt_tracker_key(template_key), cache.promoted_prompt_keys
+        )
+
+        # A new prompt sharing the [1, 2, 3] prefix: every insert is truncated at
+        # the shared prefix, so only the [6, 7] suffix reaches each personal cache.
+        shared_key = RadixKey(array("q", [1, 2, 3, 6, 7]))
+        shared_value = torch.tensor([11, 22, 33, 66, 77], dtype=torch.int64)
+
+        def lookup(user_id):
+            return cache.match_prefix(
+                MatchPrefixParams(key=shared_key, user_id=user_id)
+            ).device_indices
+
+        # Truncated inserts must count toward promotion of the shared prompt.
+        with unittest.mock.patch(
+            "sglang.srt.mem_cache.radix_cache.random.random", return_value=0.0
+        ):
+            for i in range(floor + 1):
+                result = cache.insert(
+                    InsertParams(
+                        key=shared_key,
+                        value=shared_value,
+                        user_id=f"user-{i}",
+                        track_miss_for_promotion=True,
+                    )
+                )
+                # Before promotion only the shared global prefix is matched.
+                self.assertEqual(result.prefix_len, 3)
+
+        # The floor+1-th distinct user triggered promotion of the shared prompt.
+        self.assertIn(
+            cache._build_prompt_tracker_key(shared_key), cache.promoted_prompt_keys
+        )
+        # The [6, 7] suffix now lives below the existing global prefix, so any
+        # later user is fully served by the global tree with the shared slots.
+        hit = lookup("user-later")
+        torch.testing.assert_close(hit, shared_value)
+        self.assertEqual(len(hit), 5)
 
     def test_tenant_promotion_guard_purged_on_global_eviction(self):
         """The promotion guard must be cleared when the promoted node's slots leave
@@ -774,28 +905,33 @@ class TestRadixCache(unittest.TestCase):
             mock_allocator=unittest.mock.Mock(device=torch.device("cpu")),
             enable_multi_tenant_cache=True,
         )
+        floor = cache._get_min_to_raise()
         tokens = array("q", [1, 2, 3, 4])
         key = RadixKey(tokens)
         value = torch.tensor([11, 22, 33, 44], dtype=torch.int64)
 
-        for i in range(5):
-            cache.insert(
-                InsertParams(
-                    key=key,
-                    value=value,
-                    user_id=f"user-{i}",
-                    track_miss_for_promotion=True,
+        # Force a winning roll so the floor+1-th user triggers the promotion.
+        with unittest.mock.patch(
+            "sglang.srt.mem_cache.radix_cache.random.random", return_value=0.0
+        ):
+            for i in range(floor + 1):
+                cache.insert(
+                    InsertParams(
+                        key=key,
+                        value=value,
+                        user_id=f"user-{i}",
+                        track_miss_for_promotion=True,
+                    )
                 )
-            )
         prompt_key = cache._build_prompt_tracker_key(key)
         self.assertIn(prompt_key, cache.promoted_prompt_keys)
 
-        # A fully-global hit (6th user) must not mutate the guard.
+        # A fully-global hit (later user) must not mutate the guard.
         cache.insert(
             InsertParams(
                 key=key,
                 value=value,
-                user_id="user-5",
+                user_id="user-later",
                 track_miss_for_promotion=False,
             )
         )
@@ -806,15 +942,18 @@ class TestRadixCache(unittest.TestCase):
         cache.evict(EvictParams(num_tokens=100))
         self.assertNotIn(prompt_key, cache.promoted_prompt_keys)
 
-        # A fresh distinct user can now promote the prompt again.
-        cache.insert(
-            InsertParams(
-                key=key,
-                value=value,
-                user_id="user-6",
-                track_miss_for_promotion=True,
+        # A fresh distinct user can now promote the prompt again (winning roll).
+        with unittest.mock.patch(
+            "sglang.srt.mem_cache.radix_cache.random.random", return_value=0.0
+        ):
+            cache.insert(
+                InsertParams(
+                    key=key,
+                    value=value,
+                    user_id="user-new",
+                    track_miss_for_promotion=True,
+                )
             )
-        )
         self.assertIn(prompt_key, cache.promoted_prompt_keys)
         self.assertEqual(len(cache.promoted_prompt_node_ids), 1)
 

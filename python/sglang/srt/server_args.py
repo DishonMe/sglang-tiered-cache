@@ -926,11 +926,13 @@ class ServerArgs:
     enable_multi_tenant_cache: A[
         bool,
         "Enable the multi-tenant radix cache: KV entries are keyed by the "
-        "request's user_id (or session_id), and a prompt is only promoted into "
-        "the shared global cache after it has been requested by "
-        "--promotion-threshold distinct users. Keeps a low-frequency prompt "
-        "requested by one user invisible (a full cache miss) to every other "
-        "user. Defaults to disabled (single shared cache).",
+        "request's user_id (or session_id), and a prompt is only promoted "
+        "into the shared global cache after at least 5 distinct users have "
+        "requested it; beyond that, promotion is rolled with a probability "
+        "that ramps up 1% per additional distinct user until it is "
+        "guaranteed. Keeps a low-frequency prompt requested by one user "
+        "invisible (a full cache miss) to every other user. Defaults to "
+        "disabled (single shared cache).",
         NS("memory"),
     ] = False
     enable_radix_cache_debug_log: A[
