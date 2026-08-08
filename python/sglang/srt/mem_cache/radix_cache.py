@@ -566,7 +566,18 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
                 if self._enable_debug_log:
                     logger.warning(
                         f"[DBG] user_id={user_id} key_len={key_len} "
-                        f"global_match_len={global_match_len} truncated=True"
+                        f"global_match_len={global_match_len} truncated=True "
+                        f"track={params.track_miss_for_promotion}"
+                    )
+                if params.track_miss_for_promotion and params.key is not None:
+                    self._try_promote_prompt(
+                        params=params,
+                        user_id=user_id,
+                        personal_cache=personal_cache,
+                        personal_result=personal_result,
+                        global_match_len=global_match_len,
+                        global_match_device_indices=global_match.device_indices,
+                        aligned_key=aligned_key,
                     )
                 return InsertResult(
                     prefix_len=global_match_len + personal_result.prefix_len,
@@ -584,45 +595,81 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
                 )
 
             if params.track_miss_for_promotion and params.key is not None:
-                prompt_key = self._build_prompt_tracker_key(params.key)
-                requestors = self.prompt_request_tracker[prompt_key]
-                requestors.add(user_id)
-                if (
-                    self._should_promote(len(requestors))
-                    and prompt_key not in self.promoted_prompt_keys
-                ):
-                    self.promoted_prompt_keys.add(prompt_key)
-                    # Promote the slots the personal tree actually owns (valid at
-                    # completion), not the request's raw value which may already be
-                    # freed for a chunked/growth insert.
-                    promoted_value = personal_cache._match_prefix_single(
-                        MatchPrefixParams(key=params.key)
-                    ).device_indices
-                    promoted_insert = self._insert_single(
-                        InsertParams(
-                            key=params.key,
-                            value=promoted_value,
-                            chunked=params.chunked,
-                            priority=params.priority,
-                        )
-                    )
-                    if promoted_insert.last_device_node is not None:
-                        # Track the node owning the promoted slots so eviction can
-                        # purge `promoted_prompt_keys` when they leave the tree.
-                        self.promoted_prompt_node_ids[
-                            promoted_insert.last_device_node.id
-                        ] = prompt_key
-                    # Ownership of the freshly-stored slots now belongs to the
-                    # global tree: detach the personal node WITHOUT freeing its
-                    # slots so each slot has exactly one owner.
-                    last_node = personal_result.last_device_node
-                    if (
-                        last_node is not None
-                        and last_node in personal_cache.evictable_leaves
-                    ):
-                        personal_cache._delete_leaf(last_node)
+                self._try_promote_prompt(
+                    params=params,
+                    user_id=user_id,
+                    personal_cache=personal_cache,
+                    personal_result=personal_result,
+                )
 
             return personal_result
+
+    def _try_promote_prompt(
+        self,
+        *,
+        params: InsertParams,
+        user_id: int,
+        personal_cache: "RadixCache",
+        personal_result: InsertResult,
+        global_match_len: int = 0,
+        global_match_device_indices: Optional[torch.Tensor] = None,
+        aligned_key: Optional[RadixKey] = None,
+    ) -> None:
+        """Count a tracked miss toward this prompt's distinct-user tally and, once
+        the threshold is reached, move the slots the personal tree just stored
+        into the global tree so every user of the prompt shares them.
+
+        When global_match_len > 0 the request was partially served by the global
+        tree and only the suffix belongs to the personal tree (truncated insert):
+        only that suffix is promoted, re-inserted below the global prefix the
+        request already matched, preserving the single-owner invariant.
+        """
+        prompt_key = self._build_prompt_tracker_key(params.key)
+        requestors = self.prompt_request_tracker[prompt_key]
+        requestors.add(user_id)
+        if (
+            self._should_promote(len(requestors))
+            and prompt_key not in self.promoted_prompt_keys
+        ):
+            self.promoted_prompt_keys.add(prompt_key)
+            if global_match_len > 0:
+                # The personal tree only owns the suffix: re-match it for the
+                # valid slots, then prepend the global prefix's slots so the
+                # full-key insert walks the existing global prefix and stores
+                # the suffix below it instead of as a sibling branch.
+                suffix_value = personal_cache._match_prefix_single(
+                    MatchPrefixParams(key=aligned_key[global_match_len:])
+                ).device_indices
+                promoted_value = torch.cat(
+                    [global_match_device_indices, suffix_value]
+                )
+            else:
+                # Promote the slots the personal tree actually owns (valid at
+                # completion), not the request's raw value which may already be
+                # freed for a chunked/growth insert.
+                promoted_value = personal_cache._match_prefix_single(
+                    MatchPrefixParams(key=params.key)
+                ).device_indices
+            promoted_insert = self._insert_single(
+                InsertParams(
+                    key=params.key,
+                    value=promoted_value,
+                    chunked=params.chunked,
+                    priority=params.priority,
+                )
+            )
+            if promoted_insert.last_device_node is not None:
+                # Track the node owning the promoted slots so eviction can purge
+                # `promoted_prompt_keys` when they leave the tree.
+                self.promoted_prompt_node_ids[
+                    promoted_insert.last_device_node.id
+                ] = prompt_key
+            # Ownership of the freshly-stored slots now belongs to the global
+            # tree: detach the personal node WITHOUT freeing its slots so each
+            # slot has exactly one owner.
+            last_node = personal_result.last_device_node
+            if last_node is not None and last_node in personal_cache.evictable_leaves:
+                personal_cache._delete_leaf(last_node)
 
     def _insert_single(self, params: InsertParams) -> InsertResult:
         if self.disable:
@@ -684,7 +731,10 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
                     value=values,
                     priority=priority,
                     user_id=req.user_id or req.session_id,
-                    track_miss_for_promotion=req.num_matched_prefix_tokens == 0,
+                    track_miss_for_promotion=(
+                        self._build_prompt_tracker_key(radix_key)
+                        not in self.promoted_prompt_keys
+                    ),
                 )
             )
             freed_end = result.prefix_len
@@ -730,7 +780,9 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
                 priority=req.priority or 0,
                 user_id=req.user_id or req.session_id,
                 track_miss_for_promotion=(
-                    req.num_matched_prefix_tokens == 0 and req.cache_protected_len == 0
+                    req.cache_protected_len == 0
+                    and self._build_prompt_tracker_key(radix_key)
+                    not in self.promoted_prompt_keys
                 ),
             )
         )
