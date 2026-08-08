@@ -35,6 +35,7 @@ import torch
 logger = logging.getLogger(__name__)
 
 from sglang.srt.mem_cache.base_prefix_cache import (
+    DEFAULT_TENANT_ID,
     BasePrefixCache,
     DecLockRefParams,
     DecLockRefResult,
@@ -293,13 +294,22 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         self.disable_finished_insert = params.disable_finished_insert
         self.eviction_policy = params.eviction_policy.lower()
         self._is_personal_cache = _is_personal_cache
-        self._multi_tenant_enabled = not _is_personal_cache
+        self._multi_tenant_enabled = (
+            params.enable_multi_tenant_cache and not _is_personal_cache
+        )
+        self._enable_debug_log = params.enable_radix_cache_debug_log
         self._state_lock = threading.RLock() if self._multi_tenant_enabled else None
 
         # Multi-tenant state (used by the top-level/global cache only).
         self.personal_caches: Dict[str, RadixCache] = {}
         self.prompt_request_tracker: Dict[Tuple[Optional[str], bool, Tuple[int, ...]], Set[str]] = defaultdict(set)
         self.promoted_prompt_keys: Set[Tuple[Optional[str], bool, Tuple[int, ...]]] = set()
+        # node.id -> prompt_key: lets eviction purge `promoted_prompt_keys` when the
+        # promoted node's slots leave the global tree so the prompt can be promoted
+        # again later.
+        self.promoted_prompt_node_ids: Dict[
+            int, Tuple[Optional[str], bool, Tuple[int, ...]]
+        ] = {}
 
         self.kv_event_queue = []
 
@@ -327,6 +337,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         mock_allocator: Optional[Any] = None,
         page_size: int = 1,
         enable_kv_cache_events: bool = False,
+        enable_multi_tenant_cache: bool = False,
     ) -> RadixCache:
         """Init a radix cache without memory pools for simulation purpose."""
         params = CacheInitParams(
@@ -335,6 +346,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             token_to_kv_pool_allocator=mock_allocator,
             page_size=page_size,
             enable_kv_cache_events=enable_kv_cache_events,
+            enable_multi_tenant_cache=enable_multi_tenant_cache,
         )
         return RadixCache(params)
 
@@ -345,6 +357,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             self.personal_caches.clear()
             self.prompt_request_tracker.clear()
             self.promoted_prompt_keys.clear()
+            self.promoted_prompt_node_ids.clear()
 
         self._reset_single_tree_state()
 
@@ -378,14 +391,51 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
 
         user_id = self._resolve_user_id(params.user_id, params.req)
         with self._state_lock:
-            if user_id is not None:
-                personal_cache = self.personal_caches.get(user_id)
-                if personal_cache is not None:
-                    personal_result = personal_cache._match_prefix_single(params)
-                    if self._has_match(personal_result):
-                        return personal_result
+            # Global tree first: it owns the shared (promoted) prefix slots.
+            # A personal cache stores, for post-promotion requests, only the
+            # suffix beyond the global match point, so matching personal-first
+            # (from position 0) could never re-find those suffix slots and
+            # would under-match -- and trip cache_unfinished_req's re-match
+            # invariant -- whenever a request is partly served by the global
+            # tree (e.g. a chunked prefill that promoted its first chunk).
+            global_result = self._match_prefix_single(params)
+            global_len = len(global_result.device_indices)
 
-            return self._match_prefix_single(params)
+            personal_cache = self.personal_caches.get(user_id)
+            if personal_cache is None:
+                return global_result
+
+            if global_len == 0:
+                # Nothing shared: fall back to the user's own full-key match.
+                personal_result = personal_cache._match_prefix_single(params)
+                if self._has_match(personal_result):
+                    return personal_result
+                return global_result
+
+            # Continue from the global match point inside the personal cache,
+            # whose post-promotion entries are stored as position-shifted
+            # suffixes `key[global_len:]`.
+            key = params.key
+            key, _ = key.maybe_to_bigram_view(self.is_eagle)
+            key = key.page_aligned(self.page_size)
+            if global_len >= len(key):
+                return global_result
+
+            personal_result = personal_cache._match_prefix_single(
+                MatchPrefixParams(key=key[global_len:])
+            )
+            personal_len = len(personal_result.device_indices)
+            if personal_len == 0:
+                return global_result
+
+            return MatchResult(
+                device_indices=torch.cat(
+                    [global_result.device_indices, personal_result.device_indices]
+                ),
+                last_device_node=personal_result.last_device_node,
+                last_host_node=personal_result.last_host_node,
+                best_match_node=personal_result.best_match_node,
+            )
 
     def _match_prefix_single(self, params: MatchPrefixParams) -> MatchResult:
         """Find the longest cached prefix of ``key`` in the radix tree.
@@ -453,27 +503,115 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
 
         user_id = self._resolve_user_id(params.user_id)
         with self._state_lock:
-            if user_id is None:
-                return self._insert_single(params)
+            # Single-owner invariant: a physical KV slot must be owned by exactly
+            # one tree. The global tree owns the slots of promoted prefixes, so a
+            # request served by the global tree must not re-store those shared
+            # slots into a personal cache (it would double-own them and trip the
+            # pool accounting / leak check).
+            if params.key is not None:
+                global_match = self._match_prefix_single(
+                    MatchPrefixParams(key=params.key)
+                )
+                global_match_len = len(global_match.device_indices)
+                aligned_key, _ = params.key.maybe_to_bigram_view(self.is_eagle)
+                aligned_key = aligned_key.page_aligned(self.page_size)
+                key_len = len(aligned_key)
+                if key_len > 0 and global_match_len >= key_len:
+                    # Fully served by the global tree: nothing to store.
+                    if self._enable_debug_log:
+                        logger.warning(
+                            f"[DBG] user_id={user_id} key_len={key_len} "
+                            f"global_match_len={global_match_len} hit_global=True"
+                        )
+                    return InsertResult(
+                        prefix_len=global_match_len,
+                        last_device_node=global_match.last_device_node,
+                    )
+            else:
+                global_match_len = 0
+                aligned_key = None
+                key_len = 0
 
             personal_cache = self._get_or_create_personal_cache(user_id)
-            personal_result = personal_cache._insert_single(params)
 
-            if params.track_miss_for_promotion:
+            if params.key is not None and global_match_len > 0:
+                # Partially served by the global tree: store only the suffix the
+                # global tree does not own, so each slot keeps exactly one owner.
+                # global_match_len is page-aligned, so the boundary stays on a
+                # page boundary and the returned prefix_len is consistent with
+                # the caller's freed range.
+                truncated_value = (
+                    params.value[global_match_len:]
+                    if params.value is not None
+                    else None
+                )
+                personal_result = personal_cache._insert_single(
+                    InsertParams(
+                        key=aligned_key[global_match_len:],
+                        value=truncated_value,
+                        chunked=params.chunked,
+                        priority=params.priority,
+                    )
+                )
+                if self._enable_debug_log:
+                    logger.warning(
+                        f"[DBG] user_id={user_id} key_len={key_len} "
+                        f"global_match_len={global_match_len} truncated=True"
+                    )
+                return InsertResult(
+                    prefix_len=global_match_len + personal_result.prefix_len,
+                    last_device_node=personal_result.last_device_node,
+                )
+
+            personal_result = personal_cache._insert_single(params)
+            if self._enable_debug_log:
+                logger.warning(
+                    f"[DBG] user_id={user_id} key_len={key_len} "
+                    f"global_match_len={global_match_len} "
+                    f"track={params.track_miss_for_promotion} "
+                    f"evictable={self.evictable_size()} "
+                    f"personal_tokens={personal_cache._total_size_helper()}"
+                )
+
+            if params.track_miss_for_promotion and params.key is not None:
                 prompt_key = self._build_prompt_tracker_key(params.key)
                 requestors = self.prompt_request_tracker[prompt_key]
                 requestors.add(user_id)
                 threshold = self._get_promotion_threshold()
-                if len(requestors) >= threshold and prompt_key not in self.promoted_prompt_keys:
+                if (
+                    len(requestors) >= threshold
+                    and prompt_key not in self.promoted_prompt_keys
+                ):
                     self.promoted_prompt_keys.add(prompt_key)
-                    self._insert_single(
+                    # Promote the slots the personal tree actually owns (valid at
+                    # completion), not the request's raw value which may already be
+                    # freed for a chunked/growth insert.
+                    promoted_value = personal_cache._match_prefix_single(
+                        MatchPrefixParams(key=params.key)
+                    ).device_indices
+                    promoted_insert = self._insert_single(
                         InsertParams(
                             key=params.key,
-                            value=params.value,
+                            value=promoted_value,
                             chunked=params.chunked,
                             priority=params.priority,
                         )
                     )
+                    if promoted_insert.last_device_node is not None:
+                        # Track the node owning the promoted slots so eviction can
+                        # purge `promoted_prompt_keys` when they leave the tree.
+                        self.promoted_prompt_node_ids[
+                            promoted_insert.last_device_node.id
+                        ] = prompt_key
+                    # Ownership of the freshly-stored slots now belongs to the
+                    # global tree: detach the personal node WITHOUT freeing its
+                    # slots so each slot has exactly one owner.
+                    last_node = personal_result.last_device_node
+                    if (
+                        last_node is not None
+                        and last_node in personal_cache.evictable_leaves
+                    ):
+                        personal_cache._delete_leaf(last_node)
 
             return personal_result
 
@@ -536,7 +674,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
                     key=radix_key,
                     value=values,
                     priority=priority,
-                    user_id=req.session_id,
+                    user_id=req.user_id or req.session_id,
                     track_miss_for_promotion=req.num_matched_prefix_tokens == 0,
                 )
             )
@@ -581,7 +719,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
                 value=values,
                 chunked=chunked,
                 priority=req.priority or 0,
-                user_id=req.session_id,
+                user_id=req.user_id or req.session_id,
                 track_miss_for_promotion=(
                     req.num_matched_prefix_tokens == 0 and req.cache_protected_len == 0
                 ),
@@ -596,7 +734,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
 
         # The prefix indices could be updated, reuse it
         match_result = self.match_prefix(
-            MatchPrefixParams(key=radix_key, user_id=req.session_id)
+            MatchPrefixParams(key=radix_key, user_id=req.user_id or req.session_id)
         )
         new_indices, new_last_node = (
             match_result.device_indices,
@@ -829,12 +967,18 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def _resolve_user_id(
         self, explicit_user_id: Optional[str], req: Optional[Req] = None
-    ) -> Optional[str]:
+    ) -> str:
         if explicit_user_id is not None and explicit_user_id != "":
             return explicit_user_id
-        if req is not None and req.session_id is not None and req.session_id != "":
-            return req.session_id
-        return None
+        if req is not None:
+            if req.user_id is not None and req.user_id != "":
+                return req.user_id
+            if req.session_id is not None and req.session_id != "":
+                return req.session_id
+        # No identity at all (e.g. raw /generate requests): fall back to the
+        # anonymous tenant so no request can write to or probe the global tree
+        # without crossing the promotion threshold.
+        return DEFAULT_TENANT_ID
 
     def _has_match(self, result: MatchResult) -> bool:
         return len(result.device_indices) > 0 or result.host_hit_length > 0
@@ -1019,6 +1163,12 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
                 ), f"{key=}, {child.key.child_key(self.page_size)=}"
 
     def _delete_leaf(self, node):
+        # A promoted node leaving the global tree means its slots are freed: drop
+        # the guard so the prompt can be promoted again on future full misses.
+        prompt_key = self.promoted_prompt_node_ids.pop(node.id, None)
+        if prompt_key is not None:
+            self.promoted_prompt_keys.discard(prompt_key)
+
         key = node.key.child_key(self.page_size)
         v = node.parent.children.pop(key, None)
         assert v == node, f"parent does not have child key, {key}"
