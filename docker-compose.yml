@@ -1,0 +1,17 @@
+services:
+  sglang-defense:
+    build: .
+    ports:
+      - "8000:8000"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    volumes:
+      # Mount HuggingFace cache so the model doesn't redownload
+      - ~/.cache/huggingface:/root/.cache/huggingface
+      # Mount your local tests folder into the container
+      - ../tests:/workspace/tests
