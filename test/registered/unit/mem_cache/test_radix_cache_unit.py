@@ -827,6 +827,76 @@ class TestRadixCache(unittest.TestCase):
         # The global tree owns the content exactly once.
         self.assertEqual(len(cache.root_node.children), 1)
 
+    def test_tenant_promotion_counts_truncated_global_match_inserts(self):
+        """Regression: a prompt that only PARTIALLY matches the global tree must
+        still be tracked toward promotion.
+
+        When the global tree already owns a shared prefix (e.g. a chat template),
+        a new prompt sharing that prefix is stored as a truncated insert (only the
+        suffix reaches the personal cache) and the old full-miss-only tracker never
+        counted it, so the prompt could not be promoted no matter how many distinct
+        users requested it. The truncated insert path must feed the tracker and
+        promote the suffix below the existing global prefix.
+        """
+        cache = RadixCache.create_simulated(enable_multi_tenant_cache=True)
+        floor = cache._get_min_to_raise()
+
+        # First, promote a "template + secret-A" prompt so the global tree owns a
+        # shared prefix that later prompts will partially match.
+        template_key = RadixKey(array("q", [1, 2, 3, 4, 5]))
+        template_value = torch.tensor([11, 22, 33, 44, 55], dtype=torch.int64)
+        with unittest.mock.patch(
+            "sglang.srt.mem_cache.radix_cache.random.random", return_value=0.0
+        ):
+            for i in range(floor + 1):
+                cache.insert(
+                    InsertParams(
+                        key=template_key,
+                        value=template_value,
+                        user_id=f"template-{i}",
+                        track_miss_for_promotion=True,
+                    )
+                )
+        self.assertIn(
+            cache._build_prompt_tracker_key(template_key), cache.promoted_prompt_keys
+        )
+
+        # A new prompt sharing the [1, 2, 3] prefix: every insert is truncated at
+        # the shared prefix, so only the [6, 7] suffix reaches each personal cache.
+        shared_key = RadixKey(array("q", [1, 2, 3, 6, 7]))
+        shared_value = torch.tensor([11, 22, 33, 66, 77], dtype=torch.int64)
+
+        def lookup(user_id):
+            return cache.match_prefix(
+                MatchPrefixParams(key=shared_key, user_id=user_id)
+            ).device_indices
+
+        # Truncated inserts must count toward promotion of the shared prompt.
+        with unittest.mock.patch(
+            "sglang.srt.mem_cache.radix_cache.random.random", return_value=0.0
+        ):
+            for i in range(floor + 1):
+                result = cache.insert(
+                    InsertParams(
+                        key=shared_key,
+                        value=shared_value,
+                        user_id=f"user-{i}",
+                        track_miss_for_promotion=True,
+                    )
+                )
+                # Before promotion only the shared global prefix is matched.
+                self.assertEqual(result.prefix_len, 3)
+
+        # The floor+1-th distinct user triggered promotion of the shared prompt.
+        self.assertIn(
+            cache._build_prompt_tracker_key(shared_key), cache.promoted_prompt_keys
+        )
+        # The [6, 7] suffix now lives below the existing global prefix, so any
+        # later user is fully served by the global tree with the shared slots.
+        hit = lookup("user-later")
+        torch.testing.assert_close(hit, shared_value)
+        self.assertEqual(len(hit), 5)
+
     def test_tenant_promotion_guard_purged_on_global_eviction(self):
         """The promotion guard must be cleared when the promoted node's slots leave
         the global tree, so the prompt can be promoted again on future full misses.
