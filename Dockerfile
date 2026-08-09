@@ -19,7 +19,7 @@ COPY requirements.txt /workspace/requirements.txt
 # Install dependencies using uv for fast downloads
 RUN pip install uv
 RUN uv pip install --system --upgrade pip
-RUN uv pip install --system -r /workspace/requirements.txt --index-url https://download.pytorch.org/whl/cu121
+RUN uv pip install --system -r /workspace/requirements.txt --extra-index-url https://download.pytorch.org/whl/cu121 --index-strategy unsafe-best-match
 # ---------------------------------------------------
 
 # Install SGLang and test tools
