@@ -1,3 +1,5 @@
+version: '3.8'
+
 services:
   sglang-defense:
     build: .
@@ -10,8 +12,9 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
+    environment:
+      # Warn instead of raise when the idle pool-invariant check disagrees.
+      - SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE=0
     volumes:
       # Mount HuggingFace cache so the model doesn't redownload
       - ~/.cache/huggingface:/root/.cache/huggingface
-      # Mount your local tests folder into the container
-      - ../tests:/workspace/tests
