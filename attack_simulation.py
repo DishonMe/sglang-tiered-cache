@@ -52,7 +52,25 @@ import re
 import secrets
 import sys
 import time
+import traceback
 from openai import OpenAI
+from openai import (
+    APIConnectionError,
+    APITimeoutError,
+    APIStatusError,
+    RateLimitError,
+)
+
+# Server hiccups (connection reset, 5xx, rate limit) must not abort a multi-round
+# run: each request is retried with exponential backoff before we give up.
+RETRYABLE_ERRORS = (
+    APIConnectionError,
+    APITimeoutError,
+    APIStatusError,
+    RateLimitError,
+)
+MAX_RETRIES = 5
+RETRY_BASE_DELAY_S = 2.0
 
 BASE_URL = os.environ.get("SGLANG_BASE_URL", "http://localhost:8000/v1")
 MODEL = os.environ.get("SGLANG_MODEL", "Qwen/Qwen2.5-1.5B-Instruct")
@@ -231,7 +249,7 @@ def main():
                     help="threshold = hit + FRACTION*(miss-hit)")
     ap.add_argument("--calib-iterations", type=int, default=2,
                     help="miss/hit calibration sample pairs per round")
-    ap.add_argument("--outdir", type=str, default="/home/banana/cache/tests/results")
+    ap.add_argument("--outdir", type=str, default="results")
     ap.add_argument("--log", type=str, default=None,
                     help="path to the server's stdout log (argv[1]/$SERVER_LOG fallback)")
     ap.add_argument("--seed", type=int, default=None)
@@ -247,21 +265,47 @@ def main():
 
     client = OpenAI(base_url=BASE_URL, api_key="EMPTY")
 
-    def measure(user_id, prompt):
-        t0 = time.perf_counter()
-        client.chat.completions.create(
-            model=MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            user=user_id,  # the tenant id -> per-user personal cache
-            max_tokens=4,
-        )
-        return time.perf_counter() - t0
+    def measure(user_id, prompt, retries=MAX_RETRIES):
+        """One chat-completion, measuring wall time, retrying transient errors.
 
-    # Sanity check that the server is up.
-    try:
-        client.models.list()
-    except Exception as e:  # noqa: BLE001
-        print(f"❌ Cannot reach server at {BASE_URL}: {e}")
+        A request that keeps failing after ``retries`` attempts re-raises the
+        last error; the caller aborts the run but still persists partial CSVs.
+        """
+        last_err = None
+        for attempt in range(retries + 1):
+            t0 = time.perf_counter()
+            try:
+                client.chat.completions.create(
+                    model=MODEL,
+                    messages=[{"role": "user", "content": prompt}],
+                    user=user_id,  # the tenant id -> per-user personal cache
+                    max_tokens=4,
+                )
+                return time.perf_counter() - t0
+            except RETRYABLE_ERRORS as e:  # noqa: PERF203
+                last_err = e
+                delay = RETRY_BASE_DELAY_S * (2 ** attempt)
+                print(f"[retry] {user_id} attempt {attempt + 1} failed: {e}; "
+                      f"backoff {delay:.0f}s")
+                time.sleep(delay)
+        raise last_err
+
+    # Sanity check that the server is up; give it a few chances (it may still be
+    # draining warmup load when the script starts).
+    health_err = None
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            client.models.list()
+            health_err = None
+            break
+        except Exception as e:  # noqa: BLE001
+            health_err = e
+            delay = RETRY_BASE_DELAY_S * (2 ** attempt)
+            print(f"[retry] server health check attempt {attempt + 1} failed: "
+                  f"{e}; backoff {delay:.0f}s")
+            time.sleep(delay)
+    if health_err is not None:
+        print(f"❌ Cannot reach server at {BASE_URL}: {health_err}")
         sys.exit(1)
 
     print("--- STARTING ATTACK SIMULATION ---")
@@ -277,112 +321,122 @@ def main():
     summary_rows = []
     attempt_rows = []
 
-    for r in range(1, args.rounds + 1):
-        secret = make_secret(r)
-        server_log.snapshot()
-        round_t0 = time.perf_counter()
-
-        # ---- STAGE 1: setup ----
-        n_setup = random.randint(args.min_setup, args.max_setup)
-        setup_t0 = time.perf_counter()
-        for i in range(n_setup):
-            measure(f"round{r}_setup_{i}", secret)
-        setup_time = time.perf_counter() - setup_t0
-
-        # ---- attacker calibrates his latency threshold ----
-        miss_samples, hit_samples = [], []
-        for it in range(args.calib_iterations):
-            probe = make_probe(len(secret))
-            calib_user = f"round{r}_calib_{it}"
-            miss_samples.append(measure(calib_user, probe))   # full miss (slow)
-            hit_samples.append(measure(calib_user, probe))    # personal hit (fast)
-        calib_miss = max(miss_samples)
-        calib_hit = min(hit_samples)
-        threshold = calib_hit + args.threshold_fraction * (calib_miss - calib_hit)
-
-        # ---- STAGE 2: attack ----
-        attack_t0 = time.perf_counter()
-        attempt_lat = []
-        attacker_hit_attempt = None
-        attacker_hit_latency = None
-        for j in range(1, args.max_attempts + 1):
-            lat = measure(f"round{r}_atk_{j}", secret)
-            attempt_lat.append(lat)
-            hit = lat < threshold
-            attempt_rows.append(
+    try:
+        for r in range(1, args.rounds + 1):
+            secret = make_secret(r)
+            server_log.snapshot()
+            round_t0 = time.perf_counter()
+    
+            # ---- STAGE 1: setup ----
+            n_setup = random.randint(args.min_setup, args.max_setup)
+            setup_t0 = time.perf_counter()
+            for i in range(n_setup):
+                measure(f"round{r}_setup_{i}", secret)
+            setup_time = time.perf_counter() - setup_t0
+    
+            # ---- attacker calibrates his latency threshold ----
+            miss_samples, hit_samples = [], []
+            for it in range(args.calib_iterations):
+                probe = make_probe(len(secret))
+                calib_user = f"round{r}_calib_{it}"
+                miss_samples.append(measure(calib_user, probe))   # full miss (slow)
+                hit_samples.append(measure(calib_user, probe))    # personal hit (fast)
+            calib_miss = max(miss_samples)
+            calib_hit = min(hit_samples)
+            threshold = calib_hit + args.threshold_fraction * (calib_miss - calib_hit)
+    
+            # ---- STAGE 2: attack ----
+            attack_t0 = time.perf_counter()
+            attempt_lat = []
+            attacker_hit_attempt = None
+            attacker_hit_latency = None
+            for j in range(1, args.max_attempts + 1):
+                lat = measure(f"round{r}_atk_{j}", secret)
+                attempt_lat.append(lat)
+                hit = lat < threshold
+                attempt_rows.append(
+                    {
+                        "round": r,
+                        "attempt": j,
+                        "user": f"round{r}_atk_{j}",
+                        "latency_s": round(lat, 6),
+                        "attacker_verdict": "hit" if hit else "miss",
+                    }
+                )
+                if hit:
+                    attacker_hit_attempt = j
+                    attacker_hit_latency = lat
+                    break
+            attack_time = time.perf_counter() - attack_t0
+    
+            # ---- tester-side ground truth from the server log ----
+            log = analyze_log(server_log.read_new(), r, args.max_attempts)
+    
+            attempts_made = len(attempt_lat)
+            miss_lats = [x for x in attempt_lat if x >= threshold]
+    
+            detection_matches_log = None
+            if log["log_first_hit_attempt"] is not None and attacker_hit_attempt is not None:
+                detection_matches_log = log["log_first_hit_attempt"] == attacker_hit_attempt
+    
+            # Defense invariant: never promoted before MIN_TO_RAISE + 1 distinct users.
+            floor_respected = log["log_promotion_users"] is None or log["log_promotion_users"] >= MIN_TO_RAISE + 1
+            # Attacker must eventually hit (guaranteed by 105 distinct users).
+            attack_resolved = log["log_first_hit_attempt"] is not None
+    
+            summary_rows.append(
                 {
+                    # --- round / tester choices ---
                     "round": r,
-                    "attempt": j,
-                    "user": f"round{r}_atk_{j}",
-                    "latency_s": round(lat, 6),
-                    "attacker_verdict": "hit" if hit else "miss",
+                    "setup_users": n_setup,
+                    "secret_chars": len(secret),
+                    # --- attacker-visible ---
+                    "calib_miss_s": round(calib_miss, 6),
+                    "calib_hit_s": round(calib_hit, 6),
+                    "attack_threshold_s": round(threshold, 6),
+                    "attacker_attempts": attempts_made,
+                    "attacker_hit_attempt": attacker_hit_attempt if attacker_hit_attempt is not None else "",
+                    "attacker_hit_latency_s": round(attacker_hit_latency, 6) if attacker_hit_latency is not None else "",
+                    "attacker_miss_min_s": round(min(miss_lats), 6) if miss_lats else "",
+                    "attacker_miss_median_s": round(sorted(miss_lats)[len(miss_lats) // 2], 6) if miss_lats else "",
+                    "attacker_miss_max_s": round(max(miss_lats), 6) if miss_lats else "",
+                    "setup_time_s": round(setup_time, 3),
+                    "attack_time_s": round(attack_time, 3),
+                    # --- tester ground truth (from [DBG] log) ---
+                    "log_setup_users_in_log": log["setup_users_in_log"],
+                    "log_promotion_users": log["log_promotion_users"] if log["log_promotion_users"] is not None else "",
+                    "promoted_during_setup": log["promoted_during_setup"] if log["promoted_during_setup"] is not None else "",
+                    "log_first_hit_attempt": log["log_first_hit_attempt"] if log["log_first_hit_attempt"] is not None else "",
+                    # --- verdicts ---
+                    "detection_matches_log": detection_matches_log if detection_matches_log is not None else "",
+                    "floor_respected": floor_respected,
+                    "attack_resolved": attack_resolved,
                 }
             )
-            if hit:
-                attacker_hit_attempt = j
-                attacker_hit_latency = lat
-                break
-        attack_time = time.perf_counter() - attack_t0
+    
+            status = []
+            if not floor_respected:
+                status.append("❌ FLOOR VIOLATION")
+            if attack_resolved:
+                status.append(f"hit@{log['log_first_hit_attempt']}")
+            else:
+                status.append("no global hit in log")
+            if detection_matches_log is not None and not detection_matches_log:
+                status.append("attacker/log mismatch")
+            print(f"[round {r:>2}] setup={n_setup:>2} calib(miss/hit)={calib_miss:.3f}/{calib_hit:.3f}s "
+                  f"threshold={threshold:.3f}s attempts={attempts_made:>3} "
+                  f"attacker_hit={attacker_hit_attempt or '-'} log_hit={log['log_first_hit_attempt'] or '-'} "
+                  f"promote@{log['log_promotion_users'] or '-'}u ({'; '.join(status) or 'ok'}) "
+                  f"[{time.perf_counter() - round_t0:.1f}s]")
+    except KeyboardInterrupt:
+        print("\n[interrupted] persisting partial results...")
+    except Exception:  # noqa: BLE001
+        traceback.print_exc()
+        print("\n[fatal] run aborted; persisting partial results...")
 
-        # ---- tester-side ground truth from the server log ----
-        log = analyze_log(server_log.read_new(), r, args.max_attempts)
-
-        attempts_made = len(attempt_lat)
-        miss_lats = [x for x in attempt_lat if x >= threshold]
-
-        detection_matches_log = None
-        if log["log_first_hit_attempt"] is not None and attacker_hit_attempt is not None:
-            detection_matches_log = log["log_first_hit_attempt"] == attacker_hit_attempt
-
-        # Defense invariant: never promoted before MIN_TO_RAISE + 1 distinct users.
-        floor_respected = log["log_promotion_users"] is None or log["log_promotion_users"] >= MIN_TO_RAISE + 1
-        # Attacker must eventually hit (guaranteed by 105 distinct users).
-        attack_resolved = log["log_first_hit_attempt"] is not None
-
-        summary_rows.append(
-            {
-                # --- round / tester choices ---
-                "round": r,
-                "setup_users": n_setup,
-                "secret_chars": len(secret),
-                # --- attacker-visible ---
-                "calib_miss_s": round(calib_miss, 6),
-                "calib_hit_s": round(calib_hit, 6),
-                "attack_threshold_s": round(threshold, 6),
-                "attacker_attempts": attempts_made,
-                "attacker_hit_attempt": attacker_hit_attempt if attacker_hit_attempt is not None else "",
-                "attacker_hit_latency_s": round(attacker_hit_latency, 6) if attacker_hit_latency is not None else "",
-                "attacker_miss_min_s": round(min(miss_lats), 6) if miss_lats else "",
-                "attacker_miss_median_s": round(sorted(miss_lats)[len(miss_lats) // 2], 6) if miss_lats else "",
-                "attacker_miss_max_s": round(max(miss_lats), 6) if miss_lats else "",
-                "setup_time_s": round(setup_time, 3),
-                "attack_time_s": round(attack_time, 3),
-                # --- tester ground truth (from [DBG] log) ---
-                "log_setup_users_in_log": log["setup_users_in_log"],
-                "log_promotion_users": log["log_promotion_users"] if log["log_promotion_users"] is not None else "",
-                "promoted_during_setup": log["promoted_during_setup"] if log["promoted_during_setup"] is not None else "",
-                "log_first_hit_attempt": log["log_first_hit_attempt"] if log["log_first_hit_attempt"] is not None else "",
-                # --- verdicts ---
-                "detection_matches_log": detection_matches_log if detection_matches_log is not None else "",
-                "floor_respected": floor_respected,
-                "attack_resolved": attack_resolved,
-            }
-        )
-
-        status = []
-        if not floor_respected:
-            status.append("❌ FLOOR VIOLATION")
-        if attack_resolved:
-            status.append(f"hit@{log['log_first_hit_attempt']}")
-        else:
-            status.append("no global hit in log")
-        if detection_matches_log is not None and not detection_matches_log:
-            status.append("attacker/log mismatch")
-        print(f"[round {r:>2}] setup={n_setup:>2} calib(miss/hit)={calib_miss:.3f}/{calib_hit:.3f}s "
-              f"threshold={threshold:.3f}s attempts={attempts_made:>3} "
-              f"attacker_hit={attacker_hit_attempt or '-'} log_hit={log['log_first_hit_attempt'] or '-'} "
-              f"promote@{log['log_promotion_users'] or '-'}u ({'; '.join(status) or 'ok'}) "
-              f"[{time.perf_counter() - round_t0:.1f}s]")
+    if not summary_rows:
+        print("no rounds completed; nothing to write")
+        sys.exit(1)
 
     os.makedirs(args.outdir, exist_ok=True)
     base = os.path.join(args.outdir, time.strftime("attack_%Y%m%d_%H%M%S"))
